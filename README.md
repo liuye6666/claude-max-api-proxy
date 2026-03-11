@@ -1,4 +1,95 @@
-# Claude Code CLI Provider
+# Claude Code CLI Provider (Forked)
+
+> **This is a fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with a bug fix for OpenAI array-format message content.**
+
+## Bug Fix in This Fork
+
+原仓库存在一个 bug：当消息的 `content` 字段为数组格式（OpenAI 标准格式之一）时，会被直接转为字符串导致出现 `[object Object]`，AI 会收到乱码消息。
+
+**修复内容**：在 `src/adapter/openai-to-cli.ts` 中新增 `extractText()` 函数，正确处理 `content` 为字符串或数组两种情况。
+
+```
+修复前：content = [{ type: "text", text: "你好" }]  →  "[object Object]"（乱码）
+修复后：content = [{ type: "text", text: "你好" }]  →  "你好"（正确）
+```
+
+## 安装（使用此修复版本）
+
+```bash
+# 直接从此 fork 安装（推荐，包含 bug 修复）
+npm install -g github:liuye6666/claude-max-api-proxy
+
+# 重启代理服务（macOS LaunchAgent）
+launchctl unload ~/Library/LaunchAgents/com.claude-max-api.plist
+launchctl load ~/Library/LaunchAgents/com.claude-max-api.plist
+```
+
+## 配合 OpenClaw 使用
+
+在 `~/.openclaw/openclaw.json` 中添加以下配置：
+
+```json
+{
+  "models": {
+    "providers": {
+      "claude-max": {
+        "baseUrl": "http://localhost:3456/v1",
+        "api": "openai-completions",
+        "apiKey": "not-needed",
+        "models": [
+          { "id": "claude-opus-4",   "name": "Claude Opus 4",   "input": ["text"], "contextWindow": 200000, "maxTokens": 32000 },
+          { "id": "claude-sonnet-4", "name": "Claude Sonnet 4", "input": ["text"], "contextWindow": 200000, "maxTokens": 32000 },
+          { "id": "claude-haiku-4",  "name": "Claude Haiku 4",  "input": ["text"], "contextWindow": 200000, "maxTokens": 32000 }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "claude-max/claude-opus-4" }
+    }
+  }
+}
+```
+
+## macOS 开机自启（LaunchAgent）
+
+```bash
+# 获取 node 和 standalone.js 路径
+which node
+npm root -g
+
+# 创建 LaunchAgent（路径根据实际情况修改）
+cat > ~/Library/LaunchAgents/com.claude-max-api.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.claude-max-api</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/node</string>
+    <string>/path/to/claude-max-api-proxy/dist/server/standalone.js</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/tmp/claude-max-api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/claude-max-api.log</string>
+</dict>
+</plist>
+EOF
+
+launchctl load ~/Library/LaunchAgents/com.claude-max-api.plist
+```
+
+---
+
+
 
 **Use your Claude Max subscription ($200/month) with any OpenAI-compatible client — no separate API costs!**
 
