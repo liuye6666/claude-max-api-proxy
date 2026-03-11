@@ -1,7 +1,58 @@
 /**
- * Types for Claude Code CLI JSON streaming output
+ * Types for Claude Code CLI JSON streaming output and input
  * Based on research from PROTOCOL.md
  */
+
+// ---------------------------------------------------------------------------
+// Input types (stream-json stdin format)
+// ---------------------------------------------------------------------------
+
+/** Text content block sent via stdin */
+export interface ClaudeInputTextBlock {
+  type: "text";
+  text: string;
+}
+
+/** Base64 image content block sent via stdin */
+export interface ClaudeInputImageBase64Block {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+    data: string; // base64-encoded image data (no data URI prefix)
+  };
+}
+
+/** URL image content block sent via stdin */
+export interface ClaudeInputImageUrlBlock {
+  type: "image";
+  source: {
+    type: "url";
+    url: string;
+  };
+}
+
+export type ClaudeInputImageBlock =
+  | ClaudeInputImageBase64Block
+  | ClaudeInputImageUrlBlock;
+
+export type ClaudeInputContentBlock =
+  | ClaudeInputTextBlock
+  | ClaudeInputImageBlock;
+
+/** A single user message in stream-json stdin format */
+export interface ClaudeStreamJsonUserMessage {
+  type: "user";
+  message: {
+    role: "user";
+    content: ClaudeInputContentBlock[];
+  };
+}
+
+/** Returns true when the message array contains at least one image block */
+export function hasImageContent(blocks: ClaudeInputContentBlock[]): boolean {
+  return blocks.some((b) => b.type === "image");
+}
 
 export interface ClaudeCliInit {
   type: "system";

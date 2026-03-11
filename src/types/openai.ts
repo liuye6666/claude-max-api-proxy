@@ -3,9 +3,30 @@
  * Used for Clawdbot integration
  */
 
+/** Text content part in a multimodal message */
+export interface OpenAITextPart {
+  type: "text";
+  text: string;
+}
+
+/** URL-referenced image content part */
+export interface OpenAIImageUrlPart {
+  type: "image_url";
+  image_url: {
+    url: string; // "https://..." or "data:image/...;base64,..."
+    detail?: "auto" | "low" | "high";
+  };
+}
+
+/** Content part union */
+export type OpenAIContentPart = OpenAITextPart | OpenAIImageUrlPart;
+
+/** Message content: either a plain string or an array of content parts */
+export type OpenAIMessageContent = string | OpenAIContentPart[];
+
 export interface OpenAIChatMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  content: OpenAIMessageContent;
 }
 
 export interface OpenAIChatRequest {

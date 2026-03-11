@@ -175,10 +175,12 @@ async function handleStreamingResponse(
       resolve();
     });
 
-    // Start the subprocess
+    // Start the subprocess (multimodal or plain text)
     subprocess.start(cliInput.prompt, {
       model: cliInput.model,
       sessionId: cliInput.sessionId,
+      useStdinInput: cliInput.hasImages,
+      contentBlocks: cliInput.contentBlocks,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
       reject(err);
@@ -229,11 +231,13 @@ async function handleNonStreamingResponse(
       resolve();
     });
 
-    // Start the subprocess
+    // Start the subprocess (multimodal or plain text)
     subprocess
       .start(cliInput.prompt, {
         model: cliInput.model,
         sessionId: cliInput.sessionId,
+        useStdinInput: cliInput.hasImages,
+        contentBlocks: cliInput.contentBlocks,
       })
       .catch((error) => {
         res.status(500).json({

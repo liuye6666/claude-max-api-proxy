@@ -3,17 +3,22 @@
  *
  * Handles spawning, managing, and parsing output from Claude CLI subprocesses.
  * Uses spawn() instead of exec() to prevent shell injection vulnerabilities.
+ *
+ * Two input modes:
+ *  1. Plain text (no images): prompt passed as a CLI argument  --  fast path
+ *  2. Multimodal  (images):   structured message written to stdin in
+ *     stream-json format (`--input-format stream-json`)
  */
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import fs from "fs/promises";
-import path from "path";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
   ClaudeCliResult,
   ClaudeCliStreamEvent,
+  ClaudeInputContentBlock,
+  ClaudeStreamJsonUserMessage,
 } from "../types/claude-cli.js";
 import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
@@ -23,6 +28,10 @@ export interface SubprocessOptions {
   sessionId?: string;
   cwd?: string;
   timeout?: number;
+  /** When true, the caller must provide contentBlocks instead of a prompt string */
+  useStdinInput?: boolean;
+  /** Structured content blocks written to stdin (multimodal path) */
+  contentBlocks?: ClaudeInputContentBlock[];
 }
 
 export interface SubprocessEvents {
@@ -43,22 +52,30 @@ export class ClaudeSubprocess extends EventEmitter {
   private isKilled: boolean = false;
 
   /**
-   * Start the Claude CLI subprocess with the given prompt
+   * Start the Claude CLI subprocess.
+   *
+   * @param promptOrBlocks  Plain text prompt string, or undefined when using
+   *                        the multimodal stdin path (options.useStdinInput=true).
    */
-  async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = this.buildArgs(prompt, options);
+  async start(
+    promptOrBlocks: string | undefined,
+    options: SubprocessOptions
+  ): Promise<void> {
+    const useStdin = options.useStdinInput === true;
+    const args = this.buildArgs(
+      useStdin ? undefined : (promptOrBlocks as string),
+      options
+    );
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
     return new Promise((resolve, reject) => {
       try {
-        // Use spawn() for security - no shell interpretation
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
           env: { ...process.env },
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
         this.timeoutId = setTimeout(() => {
           if (!this.isKilled) {
             this.isKilled = true;
@@ -67,7 +84,6 @@ export class ClaudeSubprocess extends EventEmitter {
           }
         }, timeout);
 
-        // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
           this.clearTimeout();
           if (err.message.includes("ENOENT")) {
@@ -81,10 +97,24 @@ export class ClaudeSubprocess extends EventEmitter {
           }
         });
 
-        // Close stdin since we pass prompt as argument
-        this.process.stdin?.end();
-
         console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
+
+        // ----------------------------------------------------------------
+        // Multimodal path: write structured message to stdin then close it
+        // ----------------------------------------------------------------
+        if (useStdin && options.contentBlocks) {
+          const stdinMessage = this.buildStdinMessage(options.contentBlocks);
+          const stdinJson = JSON.stringify(stdinMessage) + "\n";
+          this.process.stdin?.write(stdinJson, "utf8", (err) => {
+            if (err) {
+              console.error("[Subprocess] stdin write error:", err.message);
+            }
+            this.process?.stdin?.end();
+          });
+        } else {
+          // Plain text path: no stdin needed
+          this.process.stdin?.end();
+        }
 
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
@@ -94,28 +124,22 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            // Don't emit as error unless it's actually an error
-            // Claude CLI may write debug info to stderr
             console.error("[Subprocess stderr]:", errorText.slice(0, 200));
           }
         });
 
-        // Handle process close
         this.process.on("close", (code) => {
           console.error(`[Subprocess] Process closed with code: ${code}`);
           this.clearTimeout();
-          // Process any remaining buffer
           if (this.buffer.trim()) {
             this.processBuffer();
           }
           this.emit("close", code);
         });
 
-        // Resolve immediately since we're streaming
         resolve();
       } catch (err) {
         this.clearTimeout();
@@ -125,20 +149,51 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
-   * Build CLI arguments array
+   * Build the stream-json stdin message for multimodal input.
+   *
+   * Claude Code CLI expects a newline-delimited JSON object on stdin
+   * when `--input-format stream-json` is active:
+   *   { "type": "user", "message": { "role": "user", "content": [...] } }
    */
-  private buildArgs(prompt: string, options: SubprocessOptions): string[] {
-    const args = [
-      "--print", // Non-interactive mode
-      "--output-format",
-      "stream-json", // JSON streaming output
-      "--verbose", // Required for stream-json
-      "--include-partial-messages", // Enable streaming chunks
-      "--model",
-      options.model, // Model alias (opus/sonnet/haiku)
-      "--no-session-persistence", // Don't save sessions
-      prompt, // Pass prompt as argument (more reliable than stdin)
+  private buildStdinMessage(
+    blocks: ClaudeInputContentBlock[]
+  ): ClaudeStreamJsonUserMessage {
+    return {
+      type: "user",
+      message: {
+        role: "user",
+        content: blocks,
+      },
+    };
+  }
+
+  /**
+   * Build CLI arguments array.
+   *
+   * When prompt is undefined we are in multimodal stdin mode:
+   *   - add `--input-format stream-json`
+   *   - do NOT append a prompt argument
+   */
+  private buildArgs(
+    prompt: string | undefined,
+    options: SubprocessOptions
+  ): string[] {
+    const args: string[] = [
+      "--print",
+      "--output-format", "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--model", options.model,
+      "--no-session-persistence",
     ];
+
+    if (options.useStdinInput) {
+      // Multimodal mode: read message from stdin
+      args.push("--input-format", "stream-json");
+    } else if (prompt !== undefined) {
+      // Plain text mode: prompt as positional argument
+      args.push(prompt);
+    }
 
     if (options.sessionId) {
       args.push("--session-id", options.sessionId);
@@ -147,12 +202,10 @@ export class ClaudeSubprocess extends EventEmitter {
     return args;
   }
 
-  /**
-   * Process the buffer and emit parsed messages
-   */
+  /** Process buffered stdout and emit parsed messages */
   private processBuffer(): void {
     const lines = this.buffer.split("\n");
-    this.buffer = lines.pop() || ""; // Keep incomplete line
+    this.buffer = lines.pop() || "";
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -163,7 +216,6 @@ export class ClaudeSubprocess extends EventEmitter {
         this.emit("message", message);
 
         if (isContentDelta(message)) {
-          // Emit content delta for streaming
           this.emit("content_delta", message as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);
@@ -171,15 +223,11 @@ export class ClaudeSubprocess extends EventEmitter {
           this.emit("result", message);
         }
       } catch {
-        // Non-JSON output, emit as raw
         this.emit("raw", trimmed);
       }
     }
   }
 
-  /**
-   * Clear the timeout timer
-   */
   private clearTimeout(): void {
     if (this.timeoutId) {
       clearTimeout(this.timeoutId);
@@ -187,9 +235,6 @@ export class ClaudeSubprocess extends EventEmitter {
     }
   }
 
-  /**
-   * Kill the subprocess
-   */
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
       this.isKilled = true;
@@ -198,17 +243,12 @@ export class ClaudeSubprocess extends EventEmitter {
     }
   }
 
-  /**
-   * Check if the process is still running
-   */
   isRunning(): boolean {
     return this.process !== null && !this.isKilled && this.process.exitCode === null;
   }
 }
 
-/**
- * Verify that Claude CLI is installed and accessible
- */
+/** Verify that Claude CLI is installed and accessible */
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
   return new Promise((resolve) => {
     const proc = spawn("claude", ["--version"], { stdio: "pipe" });
@@ -221,8 +261,7 @@ export async function verifyClaude(): Promise<{ ok: boolean; error?: string; ver
     proc.on("error", () => {
       resolve({
         ok: false,
-        error:
-          "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
+        error: "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
       });
     });
 
@@ -230,26 +269,16 @@ export async function verifyClaude(): Promise<{ ok: boolean; error?: string; ver
       if (code === 0) {
         resolve({ ok: true, version: output.trim() });
       } else {
-        resolve({
-          ok: false,
-          error: "Claude CLI returned non-zero exit code",
-        });
+        resolve({ ok: false, error: "Claude CLI returned non-zero exit code" });
       }
     });
   });
 }
 
 /**
- * Check if Claude CLI is authenticated
- *
- * Claude Code stores credentials in the OS keychain, not a file.
- * We verify authentication by checking if we can call the CLI successfully.
- * If the CLI is installed, it typically has valid credentials from `claude auth login`.
+ * Check if Claude CLI is authenticated.
+ * Credentials are stored in the OS keychain by `claude auth login`.
  */
 export async function verifyAuth(): Promise<{ ok: boolean; error?: string }> {
-  // If Claude CLI is installed and the user has run `claude auth login`,
-  // credentials are stored in the OS keychain and will be used automatically.
-  // We can't easily check the keychain, so we'll just return true if the CLI exists.
-  // Authentication errors will surface when making actual API calls.
   return { ok: true };
 }
