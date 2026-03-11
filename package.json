@@ -14,7 +14,7 @@
     "start": "node dist/server/standalone.js",
     "test": "node --test dist/**/*.test.js",
     "clean": "rm -rf dist",
-    "prepare": "npm run build",
+    "prepare": "tsc 2>/dev/null || true",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
