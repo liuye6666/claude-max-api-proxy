@@ -1,24 +1,39 @@
 /**
  * API Route Handlers
  *
- * Implements OpenAI-compatible endpoints for Clawdbot integration
+ * Implements OpenAI-compatible endpoints for Clawdbot integration.
+ *
+ * Multi-turn session flow:
+ *  1. Client sends a request with `user` field as a stable conversation ID.
+ *  2. If `sessionManager` has no entry → first turn:
+ *       - Generate a new Claude session UUID.
+ *       - Pass `--session-id <uuid>` to CLI so it saves the session to disk.
+ *       - Store the mapping conversation_id → claude_session_id in sessionManager.
+ *       - Send full message history as context.
+ *  3. If `sessionManager` already has an entry → subsequent turn:
+ *       - Retrieve the saved Claude session UUID.
+ *       - Pass `--resume <uuid>` to CLI so it loads context from disk.
+ *       - Send only the latest user message (context already on disk).
  */
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
-import { openaiToCli } from "../adapter/openai-to-cli.js";
+import { openaiToCli, openaiToCliResume } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
-import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import type {
+  ClaudeCliAssistant,
+  ClaudeCliResult,
+  ClaudeCliStreamEvent,
+} from "../types/claude-cli.js";
+import { sessionManager } from "../session/manager.js";
 
 /**
  * Handle POST /v1/chat/completions
- *
- * Main endpoint for chat requests, supports both streaming and non-streaming
  */
 export async function handleChatCompletions(
   req: Request,
@@ -29,8 +44,11 @@ export async function handleChatCompletions(
   const stream = body.stream === true;
 
   try {
-    // Validate request
-    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+    if (
+      !body.messages ||
+      !Array.isArray(body.messages) ||
+      body.messages.length === 0
+    ) {
       res.status(400).json({
         error: {
           message: "messages is required and must be a non-empty array",
@@ -41,14 +59,73 @@ export async function handleChatCompletions(
       return;
     }
 
-    // Convert to CLI input format
-    const cliInput = openaiToCli(body);
+    // ------------------------------------------------------------------
+    // Resolve session: decide first-turn vs resume
+    // ------------------------------------------------------------------
+    const conversationId = body.user;
+    let isFirstTurn = true;
+    let newSessionId: string | undefined;
+    let resumeSessionId: string | undefined;
+
+    if (conversationId) {
+      await sessionManager.load(); // idempotent — no-op after first call
+      const existing = sessionManager.get(conversationId);
+
+      if (existing) {
+        // Subsequent turn: resume existing Claude session
+        isFirstTurn = false;
+        resumeSessionId = existing.claudeSessionId;
+        console.log(
+          `[Routes] Resuming session for conversation ${conversationId} → ${resumeSessionId}`
+        );
+      } else {
+        // First turn: create a new named Claude session
+        newSessionId = uuidv4();
+        sessionManager.getOrCreate(conversationId, newSessionId);
+        console.log(
+          `[Routes] New session for conversation ${conversationId} → ${newSessionId}`
+        );
+      }
+    } else {
+      // No conversation ID supplied: stateless single-turn (no session flags)
+      console.log("[Routes] No conversationId; running stateless single-turn");
+    }
+
+    // ------------------------------------------------------------------
+    // Build CLI input for the correct turn type
+    // ------------------------------------------------------------------
+    const cliInput = isFirstTurn
+      ? openaiToCli(body)
+      : openaiToCliResume(body);
+
     const subprocess = new ClaudeSubprocess();
 
+    // Attach the resolved session IDs
+    const subprocessOptions = {
+      model: cliInput.model,
+      newSessionId,
+      resumeSessionId,
+      useStdinInput: cliInput.hasImages,
+      contentBlocks: cliInput.contentBlocks,
+    };
+
     if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+      await handleStreamingResponse(
+        req,
+        res,
+        subprocess,
+        cliInput.prompt,
+        subprocessOptions,
+        requestId
+      );
     } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+      await handleNonStreamingResponse(
+        res,
+        subprocess,
+        cliInput.prompt,
+        subprocessOptions,
+        requestId
+      );
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -56,41 +133,36 @@ export async function handleChatCompletions(
 
     if (!res.headersSent) {
       res.status(500).json({
-        error: {
-          message,
-          type: "server_error",
-          code: null,
-        },
+        error: { message, type: "server_error", code: null },
       });
     }
   }
 }
 
+type SubprocessOpts = {
+  model: ReturnType<typeof import("../adapter/openai-to-cli.js").extractModel>;
+  newSessionId?: string;
+  resumeSessionId?: string;
+  useStdinInput?: boolean;
+  contentBlocks?: import("../types/claude-cli.js").ClaudeInputContentBlock[];
+};
+
 /**
  * Handle streaming response (SSE)
- *
- * IMPORTANT: The Express req.on("close") event fires when the request body
- * is fully received, NOT when the client disconnects. For SSE connections,
- * we use res.on("close") to detect actual client disconnection.
  */
 async function handleStreamingResponse(
   req: Request,
   res: Response,
   subprocess: ClaudeSubprocess,
-  cliInput: ReturnType<typeof openaiToCli>,
+  prompt: string | undefined,
+  options: SubprocessOpts,
   requestId: string
 ): Promise<void> {
-  // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Request-Id", requestId);
-
-  // CRITICAL: Flush headers immediately to establish SSE connection
-  // Without this, headers are buffered and client times out waiting
   res.flushHeaders();
-
-  // Send initial comment to confirm connection is alive
   res.write(":ok\n\n");
 
   return new Promise<void>((resolve, reject) => {
@@ -98,16 +170,11 @@ async function handleStreamingResponse(
     let lastModel = "claude-sonnet-4";
     let isComplete = false;
 
-    // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
-      if (!isComplete) {
-        // Client disconnected before response completed - kill subprocess
-        subprocess.kill();
-      }
+      if (!isComplete) subprocess.kill();
       resolve();
     });
 
-    // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const text = event.event.delta?.text || "";
       if (text && !res.writableEnded) {
@@ -116,21 +183,22 @@ async function handleStreamingResponse(
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: lastModel,
-          choices: [{
-            index: 0,
-            delta: {
-              role: isFirst ? "assistant" : undefined,
-              content: text,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: isFirst ? "assistant" : undefined,
+                content: text,
+              },
+              finish_reason: null,
             },
-            finish_reason: null,
-          }],
+          ],
         };
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         isFirst = false;
       }
     });
 
-    // Handle final assistant message (for model name)
     subprocess.on("assistant", (message: ClaudeCliAssistant) => {
       lastModel = message.message.model;
     });
@@ -138,7 +206,6 @@ async function handleStreamingResponse(
     subprocess.on("result", (_result: ClaudeCliResult) => {
       isComplete = true;
       if (!res.writableEnded) {
-        // Send final done chunk with finish_reason
         const doneChunk = createDoneChunk(requestId, lastModel);
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
@@ -161,13 +228,17 @@ async function handleStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
-      // Subprocess exited - ensure response is closed
       if (!res.writableEnded) {
         if (code !== 0 && !isComplete) {
-          // Abnormal exit without result - send error
-          res.write(`data: ${JSON.stringify({
-            error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
-          })}\n\n`);
+          res.write(
+            `data: ${JSON.stringify({
+              error: {
+                message: `Process exited with code ${code}`,
+                type: "server_error",
+                code: null,
+              },
+            })}\n\n`
+          );
         }
         res.write("data: [DONE]\n\n");
         res.end();
@@ -175,16 +246,12 @@ async function handleStreamingResponse(
       resolve();
     });
 
-    // Start the subprocess (multimodal or plain text)
-    subprocess.start(cliInput.prompt, {
-      model: cliInput.model,
-      sessionId: cliInput.sessionId,
-      useStdinInput: cliInput.hasImages,
-      contentBlocks: cliInput.contentBlocks,
-    }).catch((err) => {
-      console.error("[Streaming] Subprocess start error:", err);
-      reject(err);
-    });
+    subprocess
+      .start(prompt, options)
+      .catch((err) => {
+        console.error("[Streaming] Subprocess start error:", err);
+        reject(err);
+      });
   });
 }
 
@@ -194,7 +261,8 @@ async function handleStreamingResponse(
 async function handleNonStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
-  cliInput: ReturnType<typeof openaiToCli>,
+  prompt: string | undefined,
+  options: SubprocessOpts,
   requestId: string
 ): Promise<void> {
   return new Promise((resolve) => {
@@ -207,11 +275,7 @@ async function handleNonStreamingResponse(
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
       res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
+        error: { message: error.message, type: "server_error", code: null },
       });
       resolve();
     });
@@ -231,32 +295,18 @@ async function handleNonStreamingResponse(
       resolve();
     });
 
-    // Start the subprocess (multimodal or plain text)
     subprocess
-      .start(cliInput.prompt, {
-        model: cliInput.model,
-        sessionId: cliInput.sessionId,
-        useStdinInput: cliInput.hasImages,
-        contentBlocks: cliInput.contentBlocks,
-      })
+      .start(prompt, options)
       .catch((error) => {
         res.status(500).json({
-          error: {
-            message: error.message,
-            type: "server_error",
-            code: null,
-          },
+          error: { message: error.message, type: "server_error", code: null },
         });
         resolve();
       });
   });
 }
 
-/**
- * Handle GET /v1/models
- *
- * Returns available models
- */
+/** Handle GET /v1/models */
 export function handleModels(_req: Request, res: Response): void {
   res.json({
     object: "list",
@@ -283,11 +333,7 @@ export function handleModels(_req: Request, res: Response): void {
   });
 }
 
-/**
- * Handle GET /health
- *
- * Health check endpoint
- */
+/** Handle GET /health */
 export function handleHealth(_req: Request, res: Response): void {
   res.json({
     status: "ok",

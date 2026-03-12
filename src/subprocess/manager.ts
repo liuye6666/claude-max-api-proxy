@@ -5,9 +5,13 @@
  * Uses spawn() instead of exec() to prevent shell injection vulnerabilities.
  *
  * Two input modes:
- *  1. Plain text (no images): prompt passed as a CLI argument  --  fast path
+ *  1. Plain text (no images): prompt passed as a CLI argument  —  fast path
  *  2. Multimodal  (images):   structured message written to stdin in
  *     stream-json format (`--input-format stream-json`)
+ *
+ * Two session modes:
+ *  1. New session:    pass `newSessionId` (UUID) → `--session-id <id>`
+ *  2. Resume session: pass `resumeSessionId` (UUID) → `--resume <id>`
  */
 
 import { spawn, ChildProcess } from "child_process";
@@ -25,10 +29,19 @@ import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
-  sessionId?: string;
+  /**
+   * UUID for a brand-new session. Passed as `--session-id <id>`.
+   * Mutually exclusive with resumeSessionId.
+   */
+  newSessionId?: string;
+  /**
+   * UUID of an existing session to resume. Passed as `--resume <id>`.
+   * Mutually exclusive with newSessionId.
+   */
+  resumeSessionId?: string;
   cwd?: string;
   timeout?: number;
-  /** When true, the caller must provide contentBlocks instead of a prompt string */
+  /** When true, content is sent via stdin in stream-json format (multimodal path) */
   useStdinInput?: boolean;
   /** Structured content blocks written to stdin (multimodal path) */
   contentBlocks?: ClaudeInputContentBlock[];
@@ -150,10 +163,6 @@ export class ClaudeSubprocess extends EventEmitter {
 
   /**
    * Build the stream-json stdin message for multimodal input.
-   *
-   * Claude Code CLI expects a newline-delimited JSON object on stdin
-   * when `--input-format stream-json` is active:
-   *   { "type": "user", "message": { "role": "user", "content": [...] } }
    */
   private buildStdinMessage(
     blocks: ClaudeInputContentBlock[]
@@ -170,9 +179,14 @@ export class ClaudeSubprocess extends EventEmitter {
   /**
    * Build CLI arguments array.
    *
-   * When prompt is undefined we are in multimodal stdin mode:
-   *   - add `--input-format stream-json`
-   *   - do NOT append a prompt argument
+   * Session behaviour:
+   *  - newSessionId   → --session-id <id>   (first turn; session saved to disk)
+   *  - resumeSessionId → --resume <id>      (subsequent turns; loads saved session)
+   *  - neither        → no session flags    (stateless single-turn)
+   *
+   * Input behaviour:
+   *  - useStdinInput  → --input-format stream-json  (multimodal; no prompt arg)
+   *  - plain text     → prompt appended as positional arg
    */
   private buildArgs(
     prompt: string | undefined,
@@ -184,19 +198,26 @@ export class ClaudeSubprocess extends EventEmitter {
       "--verbose",
       "--include-partial-messages",
       "--model", options.model,
-      "--no-session-persistence",
     ];
 
-    if (options.useStdinInput) {
-      // Multimodal mode: read message from stdin
-      args.push("--input-format", "stream-json");
-    } else if (prompt !== undefined) {
-      // Plain text mode: prompt as positional argument
-      args.push(prompt);
+    // Session flags (mutually exclusive)
+    if (options.resumeSessionId) {
+      // Resume an existing saved session — Claude loads full context from disk
+      args.push("--resume", options.resumeSessionId);
+    } else if (options.newSessionId) {
+      // Start a new named session that will be saved to disk for future --resume
+      args.push("--session-id", options.newSessionId);
+      // NOTE: do NOT pass --no-session-persistence here; we need the session saved
+    } else {
+      // Stateless: no session tracking (legacy / single-turn fallback)
+      args.push("--no-session-persistence");
     }
 
-    if (options.sessionId) {
-      args.push("--session-id", options.sessionId);
+    // Input format
+    if (options.useStdinInput) {
+      args.push("--input-format", "stream-json");
+    } else if (prompt !== undefined) {
+      args.push(prompt);
     }
 
     return args;

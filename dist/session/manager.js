@@ -1,21 +1,26 @@
 /**
  * Session Manager
  *
- * Maps Clawdbot conversation IDs to Claude CLI session IDs
- * for maintaining conversation context across requests.
+ * Maps client conversation IDs to Claude CLI session UUIDs.
+ * Provides persistence across server restarts via a JSON file on disk.
+ *
+ * Session lifecycle:
+ *  - First turn: routes.ts calls getOrCreate(conversationId, claudeSessionId)
+ *    and passes --session-id <claudeSessionId> to Claude CLI.
+ *    Claude CLI saves the session context to disk under that UUID.
+ *  - Subsequent turns: routes.ts calls get(conversationId) to retrieve the
+ *    saved claudeSessionId, then passes --resume <claudeSessionId> to Claude
+ *    CLI which loads the context from disk.
  */
-import { v4 as uuidv4 } from "uuid";
 import fs from "fs/promises";
 import path from "path";
-const SESSION_FILE = path.join(process.env.HOME || "/tmp", ".claude-code-cli-sessions.json");
+const SESSION_FILE = path.join(process.env.HOME || "/tmp", ".claude-max-api-sessions.json");
 // Session TTL: 24 hours
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 class SessionManager {
     sessions = new Map();
     loaded = false;
-    /**
-     * Load sessions from disk
-     */
+    /** Load sessions from disk (idempotent) */
     async load() {
         if (this.loaded)
             return;
@@ -27,63 +32,54 @@ class SessionManager {
             console.log(`[SessionManager] Loaded ${this.sessions.size} sessions`);
         }
         catch {
-            // File doesn't exist or is invalid, start fresh
             this.sessions = new Map();
             this.loaded = true;
         }
     }
-    /**
-     * Save sessions to disk
-     */
+    /** Persist sessions to disk */
     async save() {
         const data = Object.fromEntries(this.sessions);
         await fs.writeFile(SESSION_FILE, JSON.stringify(data, null, 2));
     }
     /**
-     * Get or create a Claude session ID for a Clawdbot conversation
+     * Create a new session mapping.
+     * Call this on the first turn after generating a fresh claudeSessionId UUID.
      */
-    getOrCreate(clawdbotId, model = "sonnet") {
-        const existing = this.sessions.get(clawdbotId);
+    getOrCreate(conversationId, claudeSessionId, model = "sonnet") {
+        const existing = this.sessions.get(conversationId);
         if (existing) {
-            // Update last used time
             existing.lastUsedAt = Date.now();
-            existing.model = model;
-            return existing.claudeSessionId;
+            return existing;
         }
-        // Create new session
-        const claudeSessionId = uuidv4();
         const mapping = {
-            clawdbotId,
+            conversationId,
             claudeSessionId,
             createdAt: Date.now(),
             lastUsedAt: Date.now(),
             model,
         };
-        this.sessions.set(clawdbotId, mapping);
-        console.log(`[SessionManager] Created session: ${clawdbotId} -> ${claudeSessionId}`);
-        // Fire and forget save
+        this.sessions.set(conversationId, mapping);
+        console.log(`[SessionManager] Created session: ${conversationId} → ${claudeSessionId}`);
         this.save().catch((err) => console.error("[SessionManager] Save error:", err));
-        return claudeSessionId;
+        return mapping;
     }
-    /**
-     * Get existing session if it exists
-     */
-    get(clawdbotId) {
-        return this.sessions.get(clawdbotId);
+    /** Retrieve an existing session mapping */
+    get(conversationId) {
+        const mapping = this.sessions.get(conversationId);
+        if (mapping) {
+            mapping.lastUsedAt = Date.now();
+        }
+        return mapping;
     }
-    /**
-     * Delete a session
-     */
-    delete(clawdbotId) {
-        const deleted = this.sessions.delete(clawdbotId);
+    /** Remove a session (e.g. after an error or explicit reset) */
+    delete(conversationId) {
+        const deleted = this.sessions.delete(conversationId);
         if (deleted) {
             this.save().catch((err) => console.error("[SessionManager] Save error:", err));
         }
         return deleted;
     }
-    /**
-     * Clean up expired sessions
-     */
+    /** Remove sessions older than SESSION_TTL_MS */
     cleanup() {
         const cutoff = Date.now() - SESSION_TTL_MS;
         let removed = 0;
@@ -99,23 +95,16 @@ class SessionManager {
         }
         return removed;
     }
-    /**
-     * Get all active sessions
-     */
     getAll() {
         return Array.from(this.sessions.values());
     }
-    /**
-     * Get session count
-     */
     get size() {
         return this.sessions.size;
     }
 }
-// Singleton instance
 export const sessionManager = new SessionManager();
-// Initialize on module load
-sessionManager.load().catch((err) => console.error("[SessionManager] Load error:", err));
+// Kick off initial load; routes.ts also calls load() explicitly before use
+sessionManager.load().catch((err) => console.error("[SessionManager] Initial load error:", err));
 // Periodic cleanup every hour
 setInterval(() => {
     sessionManager.cleanup();

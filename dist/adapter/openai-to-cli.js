@@ -1,5 +1,20 @@
 /**
  * Converts OpenAI chat request format to Claude CLI input
+ *
+ * Session strategy:
+ *  - The OpenAI API passes a `conversation_id` (stored in `request.user`)
+ *    to identify the same ongoing conversation across multiple HTTP requests.
+ *  - On the first turn for a conversation we assign a fresh UUID as the
+ *    Claude session ID and pass `--session-id <id>` to the CLI so it saves
+ *    the session to disk.
+ *  - On subsequent turns we retrieve the saved Claude session ID and pass
+ *    `--resume <id>` so the CLI loads the full context from disk and we only
+ *    need to supply the latest user message.
+ *
+ * Image strategy:
+ *  - Plain text → prompt string passed as a CLI positional argument.
+ *  - Contains images → structured content blocks written to stdin in
+ *    stream-json format (`--input-format stream-json`).
  */
 const MODEL_MAP = {
     // Direct model names
@@ -15,21 +30,18 @@ const MODEL_MAP = {
     "sonnet": "sonnet",
     "haiku": "haiku",
 };
-/**
- * Extract Claude model alias from request model string
- */
+/** Extract Claude model alias from request model string */
 export function extractModel(model) {
     if (MODEL_MAP[model])
         return MODEL_MAP[model];
     const stripped = model.replace(/^claude-code-cli\//, "");
     if (MODEL_MAP[stripped])
         return MODEL_MAP[stripped];
-    // Default to opus (Claude Max subscription)
     return "opus";
 }
 /**
- * Convert a base64 data URI ("data:image/png;base64,ABC...") or plain base64
- * string into { media_type, data } ready for the Claude API.
+ * Convert a base64 data URI ("data:image/png;base64,ABC...") into
+ * { media_type, data } ready for the Claude API.
  */
 function parseBase64Image(url) {
     const match = url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,(.+)$/);
@@ -43,7 +55,7 @@ function parseBase64Image(url) {
 }
 /**
  * Convert a single OpenAI content part to a Claude input content block.
- * Returns null if the part cannot be represented (e.g. unsupported type).
+ * Returns null if the part cannot be represented.
  */
 function openaiPartToClaudeBlock(part) {
     if (part.type === "text") {
@@ -51,7 +63,6 @@ function openaiPartToClaudeBlock(part) {
     }
     if (part.type === "image_url") {
         const { url } = part.image_url;
-        // Data URI  →  base64 block
         const parsed = parseBase64Image(url);
         if (parsed) {
             return {
@@ -59,7 +70,6 @@ function openaiPartToClaudeBlock(part) {
                 source: { type: "base64", ...parsed },
             };
         }
-        // Plain URL  →  url block
         if (url.startsWith("http://") || url.startsWith("https://")) {
             return {
                 type: "image",
@@ -71,8 +81,6 @@ function openaiPartToClaudeBlock(part) {
 }
 /**
  * Convert OpenAI message content to an array of Claude input content blocks.
- * - string  → single text block
- * - array   → convert each part, skipping unsupported ones
  */
 function contentToBlocks(content) {
     if (typeof content === "string") {
@@ -87,18 +95,25 @@ function contentToBlocks(content) {
     return blocks;
 }
 /**
- * Convert OpenAI messages to a flat text prompt string.
- * Used when the request contains no images (legacy path, avoids stdin overhead).
+ * Extract plain text from OpenAI message content.
  */
-export function messagesToPrompt(messages) {
+function extractText(content) {
+    if (typeof content === "string")
+        return content;
+    return content
+        .filter((p) => p.type === "text")
+        .map((p) => p.text)
+        .join("");
+}
+/**
+ * Build a plain text prompt from the FULL message history.
+ * Used when there is no prior Claude session (first turn, no session tracking).
+ * All roles are included so Claude has full context on a cold start.
+ */
+export function messagesToFullPrompt(messages) {
     const parts = [];
     for (const msg of messages) {
-        // Extract only text for the plain-text path
-        const blocks = contentToBlocks(msg.content);
-        const text = blocks
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("");
+        const text = extractText(msg.content);
         switch (msg.role) {
             case "system":
                 parts.push(`<system>\n${text}\n</system>\n`);
@@ -114,11 +129,19 @@ export function messagesToPrompt(messages) {
     return parts.join("\n").trim();
 }
 /**
- * Convert OpenAI messages to a flat list of Claude content blocks.
- * Used when the request contains images (stdin stream-json path).
- *
- * System and assistant messages are prepended as text blocks so context
- * is preserved, then all user blocks follow.
+ * Extract only the latest user message as a plain text prompt.
+ * Used when resuming an existing Claude session (context already on disk).
+ */
+export function latestUserPrompt(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+            return extractText(messages[i].content);
+        }
+    }
+    return "";
+}
+/**
+ * Build content blocks for the FULL message history (first turn with images).
  */
 export function messagesToBlocks(messages) {
     const preamble = [];
@@ -127,20 +150,14 @@ export function messagesToBlocks(messages) {
         const blocks = contentToBlocks(msg.content);
         switch (msg.role) {
             case "system": {
-                const text = blocks
-                    .filter((b) => b.type === "text")
-                    .map((b) => b.text)
-                    .join("");
+                const text = extractText(msg.content);
                 if (text) {
                     preamble.push({ type: "text", text: `<system>\n${text}\n</system>` });
                 }
                 break;
             }
             case "assistant": {
-                const text = blocks
-                    .filter((b) => b.type === "text")
-                    .map((b) => b.text)
-                    .join("");
+                const text = extractText(msg.content);
                 if (text) {
                     preamble.push({
                         type: "text",
@@ -157,16 +174,27 @@ export function messagesToBlocks(messages) {
     return [...preamble, ...userBlocks];
 }
 /**
+ * Extract only the latest user message content blocks (for session-resume with images).
+ */
+function latestUserBlocks(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+            return contentToBlocks(messages[i].content);
+        }
+    }
+    return [];
+}
+/**
  * Convert OpenAI chat request to CLI input format.
  *
- * If the request contains images, returns contentBlocks + hasImages=true so
- * the subprocess manager uses the stdin stream-json path.
- * Otherwise returns a plain text prompt for the simple CLI argument path.
+ * The returned `CliInput` does NOT include the resolved Claude session UUID;
+ * that is filled in by `routes.ts` after consulting `sessionManager` so that
+ * this adapter stays pure / testable.
  */
 export function openaiToCli(request) {
     const model = extractModel(request.model);
-    const sessionId = request.user;
-    // Check whether any message contains an image part
+    // Clients may pass a stable conversation ID in the `user` field.
+    const conversationId = request.user;
     const hasImages = request.messages.some((msg) => {
         if (typeof msg.content !== "string") {
             return msg.content.some((p) => p.type === "image_url");
@@ -174,14 +202,56 @@ export function openaiToCli(request) {
         return false;
     });
     if (hasImages) {
+        // For image requests we always include the full history on the first turn;
+        // routes.ts will decide whether to use --session-id or --resume based on
+        // sessionManager state.
         const contentBlocks = messagesToBlocks(request.messages);
-        return { contentBlocks, hasImages: true, model, sessionId };
+        return {
+            contentBlocks,
+            hasImages: true,
+            model,
+            conversationId,
+            isFirstTurn: true, // refined by routes.ts
+        };
     }
+    // Plain text — full prompt assembled here; routes.ts will narrow it to
+    // latestUserPrompt if the session already exists.
     return {
-        prompt: messagesToPrompt(request.messages),
+        prompt: messagesToFullPrompt(request.messages),
         hasImages: false,
         model,
-        sessionId,
+        conversationId,
+        isFirstTurn: true, // refined by routes.ts
+    };
+}
+/**
+ * Re-derive the prompt/blocks for a session-resume request (subsequent turns).
+ * Only the latest user message is sent; Claude CLI loads prior context from disk.
+ */
+export function openaiToCliResume(request) {
+    const model = extractModel(request.model);
+    const conversationId = request.user;
+    const hasImages = request.messages.some((msg) => {
+        if (typeof msg.content !== "string") {
+            return msg.content.some((p) => p.type === "image_url");
+        }
+        return false;
+    });
+    if (hasImages) {
+        return {
+            contentBlocks: latestUserBlocks(request.messages),
+            hasImages: true,
+            model,
+            conversationId,
+            isFirstTurn: false,
+        };
+    }
+    return {
+        prompt: latestUserPrompt(request.messages),
+        hasImages: false,
+        model,
+        conversationId,
+        isFirstTurn: false,
     };
 }
 //# sourceMappingURL=openai-to-cli.js.map

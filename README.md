@@ -1,66 +1,168 @@
-# Claude Code CLI Provider (Forked)
+# claude-max-api-proxy
 
-> **This is a fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with a bug fix for OpenAI array-format message content.**
+将 Claude Code CLI（Claude Max 订阅）包装为 **OpenAI 兼容的 HTTP API**，让任何支持 OpenAI 格式的客户端（如 OpenClaw、Cursor、Continue 等）都能直接使用你的 Claude Max 订阅，无需额外付费购买 Anthropic API。
 
-## Bug Fix in This Fork
+> **说明**：本项目基于 [operand-ai/claude-max-api-proxy](https://github.com/operand-ai/claude-max-api-proxy) fork，包含以下修复和增强：
+> - 修复 `[object Object]` 消息乱码 bug（原始 bug：多部分消息内容未正确提取文本）
+> - 支持图片（multimodal）输入
+> - 支持真正的多轮对话（通过 `--resume` 机制持久化 session 上下文）
 
-原仓库存在一个 bug：当消息的 `content` 字段为数组格式（OpenAI 标准格式之一）时，会被直接转为字符串导致出现 `[object Object]`，AI 会收到乱码消息。
+---
 
-**修复内容**：在 `src/adapter/openai-to-cli.ts` 中新增 `extractText()` 函数，正确处理 `content` 为字符串或数组两种情况。
+## 前提条件
 
-```
-修复前：content = [{ type: "text", text: "你好" }]  →  "[object Object]"（乱码）
-修复后：content = [{ type: "text", text: "你好" }]  →  "你好"（正确）
-```
+1. **Claude Max 订阅**（$100/月的个人版或更高）
+2. **Claude Code CLI** 已安装并登录：
+   ```bash
+   npm install -g @anthropic-ai/claude-code
+   claude --version      # 确认已安装
+   claude auth login     # 登录你的 Anthropic 账户
+   ```
+3. **Node.js 18+**
 
-## 安装（使用此修复版本）
+---
+
+## 安装
+
+### 方式一：从本仓库安装（推荐）
 
 ```bash
-# 直接从此 fork 安装（推荐，包含 bug 修复）
 npm install -g github:liuye6666/claude-max-api-proxy
-
-# 重启代理服务（macOS LaunchAgent）
-launchctl unload ~/Library/LaunchAgents/com.claude-max-api.plist
-launchctl load ~/Library/LaunchAgents/com.claude-max-api.plist
 ```
 
-## 配合 OpenClaw 使用
-
-在 `~/.openclaw/openclaw.json` 中添加以下配置：
-
-```json
-{
-  "models": {
-    "providers": {
-      "claude-max": {
-        "baseUrl": "http://localhost:3456/v1",
-        "api": "openai-completions",
-        "apiKey": "not-needed",
-        "models": [
-          { "id": "claude-opus-4",   "name": "Claude Opus 4",   "input": ["text"], "contextWindow": 200000, "maxTokens": 32000 },
-          { "id": "claude-sonnet-4", "name": "Claude Sonnet 4", "input": ["text"], "contextWindow": 200000, "maxTokens": 32000 },
-          { "id": "claude-haiku-4",  "name": "Claude Haiku 4",  "input": ["text"], "contextWindow": 200000, "maxTokens": 32000 }
-        ]
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": { "primary": "claude-max/claude-opus-4" }
-    }
-  }
-}
-```
-
-## macOS 开机自启（LaunchAgent）
+### 方式二：从源码安装
 
 ```bash
-# 获取 node 和 standalone.js 路径
-which node
-npm root -g
+git clone https://github.com/liuye6666/claude-max-api-proxy.git
+cd claude-max-api-proxy
+npm install
+npm run build
+npm install -g .
+```
 
-# 创建 LaunchAgent（路径根据实际情况修改）
-cat > ~/Library/LaunchAgents/com.claude-max-api.plist << 'EOF'
+---
+
+## 启动代理服务器
+
+```bash
+claude-max-api-proxy
+```
+
+默认监听 `http://localhost:3456`。
+
+### 可选环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `3456` | 监听端口 |
+| `HOST` | `0.0.0.0` | 监听地址（`127.0.0.1` 限制本机访问） |
+| `DEFAULT_MODEL` | `claude-sonnet-4` | 未指定模型时的默认模型 |
+
+---
+
+## 可用模型
+
+| 模型 ID | 说明 |
+|---------|------|
+| `claude-opus-4` | 最强模型，适合复杂任务 |
+| `claude-sonnet-4` | 平衡性能与速度（默认） |
+| `claude-haiku-4` | 最快，适合简单任务 |
+
+---
+
+## API 端点
+
+### `POST /v1/chat/completions`
+
+标准 OpenAI 聊天补全接口，支持流式（`stream: true`）和非流式。
+
+**多轮对话**：在请求的 `user` 字段中传入一个稳定的会话 ID（如 UUID），代理会自动：
+- 首次请求：用 `--session-id` 创建新 Claude session，保存到磁盘
+- 后续请求：用 `--resume` 恢复已有 session，只传入最新一条消息
+
+```bash
+curl http://localhost:3456/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "messages": [{"role": "user", "content": "你好，介绍一下自己"}],
+    "user": "my-conversation-id-123"
+  }'
+```
+
+**图片输入**（multimodal）：
+
+```bash
+curl http://localhost:3456/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus-4",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "这张图里有什么？"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}}
+      ]
+    }]
+  }'
+```
+
+### `GET /v1/models`
+
+返回可用模型列表。
+
+### `GET /health`
+
+健康检查。
+
+---
+
+## 在 OpenClaw 中使用
+
+### 1. 启动代理服务（或配置为自动启动，见下方）
+
+```bash
+claude-max-api-proxy
+```
+
+### 2. 配置 OpenClaw 指向代理
+
+```bash
+openclaw config set models.providers.claude-max.baseUrl "http://localhost:3456/v1"
+openclaw config set models.providers.claude-max.apiKey "dummy"
+```
+
+### 3. 切换模型
+
+```bash
+# 切换到 Claude Opus 4（最强）
+openclaw config set agents.defaults.model.primary "claude-max/claude-opus-4"
+
+# 切换到 Claude Sonnet 4（平衡）
+openclaw config set agents.defaults.model.primary "claude-max/claude-sonnet-4"
+
+# 切换到 Claude Haiku 4（最快）
+openclaw config set agents.defaults.model.primary "claude-max/claude-haiku-4"
+
+# 恢复使用 GLM-5
+openclaw config set agents.defaults.model.primary "zai/glm-5"
+```
+
+### 4. 重启 OpenClaw 网关
+
+通过 OpenClaw 菜单栏 App 重启，或：
+
+```bash
+scripts/restart-mac.sh
+```
+
+---
+
+## 配置为 macOS 后台服务（LaunchAgent）
+
+创建文件 `~/Library/LaunchAgents/com.claude-max-api.plist`：
+
+```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -76,258 +178,57 @@ cat > ~/Library/LaunchAgents/com.claude-max-api.plist << 'EOF'
     <string>/path/to/node</string>
     <string>/path/to/claude-max-api-proxy/dist/server/standalone.js</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/yourname</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>/tmp/claude-max-api.log</string>
   <key>StandardErrorPath</key>
   <string>/tmp/claude-max-api.log</string>
 </dict>
 </plist>
-EOF
+```
 
+替换 `/path/to/node`（用 `which node` 查找）和 `/path/to/claude-max-api-proxy`（用 `npm root -g` 查找），然后：
+
+```bash
 launchctl load ~/Library/LaunchAgents/com.claude-max-api.plist
 ```
 
 ---
 
-
-
-**Use your Claude Max subscription ($200/month) with any OpenAI-compatible client — no separate API costs!**
-
-This provider wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like Clawdbot, Continue.dev, or any OpenAI-compatible client to use your Claude Max subscription instead of paying per-API-call.
-
-## Why This Exists
-
-| Approach | Cost | Limitation |
-|----------|------|------------|
-| Claude API | ~$15/M input, ~$75/M output tokens | Pay per use |
-| Claude Max | $200/month flat | OAuth blocked for third-party API use |
-| **This Provider** | $0 extra (uses Max subscription) | Routes through CLI |
-
-Anthropic blocks OAuth tokens from being used directly with third-party API clients. However, the Claude Code CLI *can* use OAuth tokens. This provider bridges that gap by wrapping the CLI and exposing a standard API.
-
-## How It Works
+## 多轮对话工作原理
 
 ```
-Your App (Clawdbot, etc.)
-         ↓
-    HTTP Request (OpenAI format)
-         ↓
-   Claude Code CLI Provider (this project)
-         ↓
-   Claude Code CLI (subprocess)
-         ↓
-   OAuth Token (from Max subscription)
-         ↓
-   Anthropic API
-         ↓
-   Response → OpenAI format → Your App
+第 1 轮请求 (user: "conv-abc")
+  ├─ sessionManager 无记录 → 生成新 UUID: "550e8400-..."
+  ├─ 调用 claude --session-id 550e8400-... [完整消息历史]
+  ├─ Claude CLI 将 session 保存到 ~/.claude/sessions/550e8400-.../
+  └─ sessionManager 记录: conv-abc → 550e8400-...
+
+第 2 轮请求 (user: "conv-abc")
+  ├─ sessionManager 找到记录 → resumeId = "550e8400-..."
+  ├─ 调用 claude --resume 550e8400-... [仅最新一条 user 消息]
+  └─ Claude CLI 从磁盘加载完整上下文，继续对话
 ```
 
-## Features
+Session 文件保存在 `~/.claude-max-api-sessions.json`，TTL 为 24 小时。
 
-- **OpenAI-compatible API** — Works with any client that supports OpenAI's API format
-- **Streaming support** — Real-time token streaming via Server-Sent Events
-- **Multiple models** — Claude Opus, Sonnet, and Haiku
-- **Session management** — Maintains conversation context
-- **Auto-start service** — Optional LaunchAgent for macOS
-- **Zero configuration** — Uses existing Claude CLI authentication
-- **Secure by design** — Uses spawn() to prevent shell injection
+---
 
-## Prerequisites
+## 注意事项
 
-1. **Claude Max subscription** ($200/month) — [Subscribe here](https://claude.ai)
-2. **Claude Code CLI** installed and authenticated:
-   ```bash
-   npm install -g @anthropic-ai/claude-code
-   claude auth login
-   ```
+- 本项目**不是** Anthropic 官方产品，使用时请遵守 [Anthropic 使用政策](https://www.anthropic.com/legal/usage-policy)。
+- Claude Code CLI 需要保持登录状态（`claude auth login`）。
+- 仅供个人使用，请勿用于商业 API 服务。
+- 如果 Claude Code CLI 未登录或 session 过期，代理会返回相应错误。
 
-## Installation
+---
 
-```bash
-# Clone the repository
-git clone https://github.com/anthropics/claude-code-cli-provider.git
-cd claude-code-cli-provider
-
-# Install dependencies
-npm install
-
-# Build
-npm run build
-```
-
-## Usage
-
-### Start the server
-
-```bash
-node dist/server/standalone.js
-```
-
-The server runs at `http://localhost:3456` by default.
-
-### Test it
-
-```bash
-# Health check
-curl http://localhost:3456/health
-
-# List models
-curl http://localhost:3456/v1/models
-
-# Chat completion (non-streaming)
-curl -X POST http://localhost:3456/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-opus-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-
-# Chat completion (streaming)
-curl -N -X POST http://localhost:3456/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-opus-4",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
-```
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
-
-## Available Models
-
-| Model ID | Maps To |
-|----------|---------|
-| `claude-opus-4` | Claude Opus 4.5 |
-| `claude-sonnet-4` | Claude Sonnet 4 |
-| `claude-haiku-4` | Claude Haiku 4 |
-
-## Configuration with Popular Tools
-
-### Clawdbot
-
-Clawdbot has **built-in support** for Claude CLI OAuth! Check your config:
-
-```bash
-clawdbot models status
-```
-
-If you see `anthropic:claude-cli=OAuth`, you're already using your Max subscription.
-
-### Continue.dev
-
-Add to your Continue config:
-
-```json
-{
-  "models": [{
-    "title": "Claude (Max)",
-    "provider": "openai",
-    "model": "claude-opus-4",
-    "apiBase": "http://localhost:3456/v1",
-    "apiKey": "not-needed"
-  }]
-}
-```
-
-### Generic OpenAI Client (Python)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:3456/v1",
-    api_key="not-needed"  # Any value works
-)
-
-response = client.chat.completions.create(
-    model="claude-opus-4",
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-```
-
-## Auto-Start on macOS
-
-Create a LaunchAgent to start the provider automatically on login. See `docs/macos-setup.md` for detailed instructions.
-
-## Architecture
-
-```
-src/
-├── types/
-│   ├── claude-cli.ts      # Claude CLI JSON output types
-│   └── openai.ts          # OpenAI API types
-├── adapter/
-│   ├── openai-to-cli.ts   # Convert OpenAI requests → CLI format
-│   └── cli-to-openai.ts   # Convert CLI responses → OpenAI format
-├── subprocess/
-│   └── manager.ts         # Claude CLI subprocess management
-├── session/
-│   └── manager.ts         # Session ID mapping
-├── server/
-│   ├── index.ts           # Express server setup
-│   ├── routes.ts          # API route handlers
-│   └── standalone.ts      # Entry point
-└── index.ts               # Package exports
-```
-
-## Security
-
-- Uses Node.js `spawn()` instead of shell execution to prevent injection attacks
-- No API keys stored or transmitted by this provider
-- All authentication handled by Claude CLI's secure keychain storage
-- Prompts passed as CLI arguments, not through shell interpretation
-
-## Cost Savings Example
-
-| Usage | API Cost | With This Provider |
-|-------|----------|-------------------|
-| 1M input tokens/month | ~$15 | $0 (included in Max) |
-| 500K output tokens/month | ~$37.50 | $0 (included in Max) |
-| **Monthly Total** | **~$52.50** | **$0 extra** |
-
-If you're already paying for Claude Max, this provider lets you use that subscription for API-style access at no additional cost.
-
-## Troubleshooting
-
-### "Claude CLI not found"
-
-Install and authenticate the CLI:
-```bash
-npm install -g @anthropic-ai/claude-code
-claude auth login
-```
-
-### Streaming returns immediately with no content
-
-Ensure you're using `-N` flag with curl (disables buffering):
-```bash
-curl -N -X POST http://localhost:3456/v1/chat/completions ...
-```
-
-### Server won't start
-
-Check that the Claude CLI is in your PATH:
-```bash
-which claude
-```
-
-## Contributing
-
-Contributions welcome! Please submit PRs with tests.
-
-## License
+## 许可证
 
 MIT
-
-## Acknowledgments
-
-- Built for use with [Clawdbot](https://clawd.bot)
-- Powered by [Claude Code CLI](https://github.com/anthropics/claude-code)
